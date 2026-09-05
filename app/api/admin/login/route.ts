@@ -12,15 +12,6 @@ export async function POST(request: Request) {
   const configuredUsername = process.env.ADMIN_USERNAME;
   const configuredPassword = process.env.ADMIN_PASSWORD;
 
-  // Temporary diagnostic log.
-  // IMPORTANT: Never log the actual password.
-  console.log("Admin env check:", {
-    usernameExists: Boolean(configuredUsername),
-    passwordExists: Boolean(configuredPassword),
-    receivedUsername:
-      typeof username === "string" ? username : null,
-  });
-
   if (
     typeof username !== "string" ||
     typeof password !== "string" ||
