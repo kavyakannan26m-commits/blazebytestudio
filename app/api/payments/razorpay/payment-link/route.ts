@@ -1,0 +1,213 @@
+﻿import { NextResponse } from "next/server";
+import crypto from "node:crypto";
+import { createSupabaseAdminClient } from "@/lib/supabase/admin";
+
+const RAZORPAY_KEY_ID = process.env.RAZORPAY_KEY_ID?.trim();
+const RAZORPAY_KEY_SECRET = process.env.RAZORPAY_KEY_SECRET?.trim();
+const SITE_URL =
+  process.env.NEXT_PUBLIC_SITE_URL?.trim() ||
+  "http://localhost:3000";
+
+function clean(value: unknown, max = 500) {
+  return String(value ?? "").trim().slice(0, max);
+}
+
+export async function POST(request: Request) {
+  try {
+    if (!RAZORPAY_KEY_ID || !RAZORPAY_KEY_SECRET) {
+      return NextResponse.json(
+        { error: "Razorpay is not configured." },
+        { status: 500 }
+      );
+    }
+
+    const body = await request.json();
+
+    const fullName = clean(body.fullName, 120);
+    const email = clean(body.email, 180);
+    const phone = clean(body.phone, 40);
+    const message = clean(body.message, 2000);
+    const courseSlug = clean(body.courseSlug, 120);
+
+    if (!fullName || !email || !phone || !courseSlug) {
+      return NextResponse.json(
+        { error: "Required enrollment details are missing." },
+        { status: 400 }
+      );
+    }
+
+    const supabase = createSupabaseAdminClient();
+
+    if (!supabase) {
+      return NextResponse.json(
+        { error: "Database access is not configured." },
+        { status: 503 }
+      );
+    }
+
+    const { data: course, error: courseError } = await supabase
+      .from("courses")
+      .select(
+        "id,title,slug,price,discount_price,status,razorpay_payment_link"
+      )
+      .eq("slug", courseSlug)
+      .eq("status", "published")
+      .maybeSingle();
+
+    if (courseError) {
+      throw new Error(courseError.message);
+    }
+
+    if (!course) {
+      return NextResponse.json(
+        { error: "Course not found." },
+        { status: 404 }
+      );
+    }
+
+    const amount = Number(course.discount_price ?? course.price);
+
+    if (!Number.isFinite(amount) || amount <= 0) {
+      return NextResponse.json(
+        { error: "Course price is invalid." },
+        { status: 400 }
+      );
+    }
+
+    const referenceNumber = `BB-${crypto
+      .randomUUID()
+      .replace(/-/g, "")
+      .slice(0, 16)
+      .toUpperCase()}`;
+
+    const { data: enquiry, error: enquiryError } =
+      await supabase
+        .from("customer_requests")
+        .insert({
+          name: fullName,
+          email,
+          phone,
+          subject: course.title,
+          message:
+            message || `Course enquiry for ${course.title}`,
+          privacy_consent: true,
+          reference_number: referenceNumber,
+          request_type: "enquiry",
+          quoted_price: `₹${amount}`,
+          payment_status: "pending",
+          payment_amount: Math.round(amount * 100),
+          payment_currency: "INR",
+        })
+        .select("id,reference_number")
+        .single();
+
+    if (enquiryError) {
+      throw new Error(enquiryError.message);
+    }
+
+    const razorpayResponse = await fetch(
+      "https://api.razorpay.com/v1/payment_links",
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization:
+            "Basic " +
+            Buffer.from(
+              `${RAZORPAY_KEY_ID}:${RAZORPAY_KEY_SECRET}`
+            ).toString("base64"),
+        },
+        body: JSON.stringify({
+          amount: Math.round(amount * 100),
+          currency: "INR",
+          accept_partial: false,
+          reference_id: referenceNumber,
+          description: `BlazeByte Studio - ${course.title}`,
+
+          customer: {
+            name: fullName,
+            contact: phone,
+            email,
+          },
+
+          notify: {
+            sms: false,
+            email: false,
+          },
+
+          reminder_enable: false,
+
+          notes: {
+            enquiry_id: enquiry.id,
+            course_id: course.id,
+            course_slug: course.slug,
+            reference_number: referenceNumber,
+          },
+
+          callback_url:
+            `${SITE_URL}/api/payments/razorpay/callback`,
+
+          callback_method: "get",
+        }),
+      }
+    );
+
+    const razorpayData = await razorpayResponse.json();
+
+    if (!razorpayResponse.ok) {
+      console.error(
+        "RAZORPAY PAYMENT LINK ERROR:",
+        razorpayData
+      );
+
+      throw new Error(
+        razorpayData?.error?.description ||
+          "Unable to create Razorpay Payment Link."
+      );
+    }
+
+    const paymentLinkId = razorpayData.id;
+    const shortUrl = razorpayData.short_url;
+
+    if (!paymentLinkId || !shortUrl) {
+      throw new Error(
+        "Razorpay did not return a valid Payment Link."
+      );
+    }
+
+    const { error: updateError } = await supabase
+      .from("customer_requests")
+      .update({
+        razorpay_payment_link_id: paymentLinkId,
+      })
+      .eq("id", enquiry.id);
+
+    if (updateError) {
+      throw new Error(updateError.message);
+    }
+
+    return NextResponse.json({
+      success: true,
+      paymentUrl: shortUrl,
+      paymentLinkId,
+      referenceNumber,
+      amount,
+      courseName: course.title,
+    });
+  } catch (error) {
+    console.error(
+      "PAYMENT LINK CREATION ERROR:",
+      error
+    );
+
+    return NextResponse.json(
+      {
+        error:
+          error instanceof Error
+            ? error.message
+            : "Unable to create payment link.",
+      },
+      { status: 500 }
+    );
+  }
+}
